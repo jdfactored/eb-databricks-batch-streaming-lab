@@ -11,6 +11,36 @@ writes `%sql` where the scaffold suggested Python still passes, and should.
 
 ## B01 — Batch Ingestion and Delta Engineering
 
+### Step 0 — Initial Exploration
+
+```python
+# 1. List the sales files
+sales_files = sorted(utils.list_files(raw_path))
+print(f"{len(sales_files)} file(s):")
+for f in sales_files:
+    print(f"  {f}")
+
+# 2. Compare the header of the first and last file
+first_file, last_file = sales_files[0], sales_files[-1]
+
+print(f"--- {first_file} ---")
+print(dbutils.fs.head(f"{raw_path}/{first_file}", 500))
+
+print(f"\n--- {last_file} ---")
+print(dbutils.fs.head(f"{raw_path}/{last_file}", 500))
+
+# 3. Read one delta file and inspect status
+delta_df = (
+    spark.read
+    .format("csv")
+    .option("header", "true")
+    .option("inferSchema", "true")
+    .load(f"{raw_path}/{sales_files[1]}")   # a delta file, not day-0
+)
+
+delta_df.select("status").distinct().show()
+```
+
 ### Step 1 — Idempotent ingestion
 
 Auto Loader version (the one most students pick):
@@ -57,6 +87,32 @@ COPY_OPTIONS ('mergeSchema' = 'true');
 registry). With `COPY INTO` it is stored in the Delta table's own transaction log. Either
 way it lives outside the SQL, which is why re-running the identical statement is safe.
 
+### Step 1 — Idempotent ingestion
+
+```python
+# 1. Record the current row count
+count_before = utils.get_table_row_count(bronze_table)
+print(f"rows before second run: {count_before}")
+
+# 2. Run the ingestion function again, unchanged
+ingest_sales(bronze_table, raw_path)
+
+# 3. Compare
+count_after = utils.get_table_row_count(bronze_table)
+print(f"rows after second run:  {count_after}")
+
+assert count_before == count_after, (
+    f"Row count changed from {count_before} to {count_after} — "
+    f"the second run reprocessed files it should have skipped."
+)
+print("Idempotent: row count unchanged.")
+
+# 4. Look at DESCRIBE HISTORY
+display(spark.sql(f"DESCRIBE HISTORY {bronze_table}"))
+
+
+```
+
 ### Step 3 — Schema evolution
 
 Both sides matter, and this is the most common partial failure:
@@ -68,23 +124,37 @@ Both sides matter, and this is the most common partial failure:
 Get the write side only and the column is added but always null — which is exactly what
 `test_schema_evolution_absorbed_region` catches.
 
+```python
+cols = utils.get_column_names(bronze_table)
+print("region" in cols)  # should be True
+
+spark.sql(f"""
+    SELECT
+        SUM(CASE WHEN region IS NULL THEN 1 ELSE 0 END) AS null_region,
+        SUM(CASE WHEN region IS NOT NULL THEN 1 ELSE 0 END) AS has_region
+    FROM {bronze_table}
+""").show()
+```
+
 **Expected answer on type widening:** `addNewColumns` adds columns, it does not change the
 type of an existing one. A `price` of `"19.99 USD"` against an inferred `DOUBLE` goes to
 `_rescued_data` as JSON. Students should know to look there.
 
-### Step 4/5 — CDC merge
+### Step 4
 
 ```python
-def create_silver_sales(t: str) -> None:
+def create_silver_sales(full_table_name: str) -> None:
     spark.sql(f"""
-        CREATE TABLE IF NOT EXISTS {t} (
+        CREATE TABLE IF NOT EXISTS {full_table_name} (
             sale_id INT, product_id INT, user_id INT,
             quantity INT, price DOUBLE, region STRING,
             _is_active BOOLEAN, _created_at DATE, _updated_at DATE, _source_file STRING
         ) USING DELTA
     """)
+```
+### Step 5 — CDC merge
 
-
+```python
 def cdc_merge(bronze: str, silver: str, filter_date: str) -> None:
     spark.sql(f"""
         MERGE INTO {silver} AS t
@@ -123,6 +193,12 @@ def all_change_dates(bronze: str) -> list:
     return [r[0].isoformat() for r in spark.sql(
         f"SELECT DISTINCT updated_at FROM {bronze} ORDER BY updated_at"
     ).collect()]
+
+for filter_date in all_change_dates(bronze_table):
+    cdc_merge(bronze_table, silver_table, filter_date)
+    print(f"merged {filter_date}")
+
+print(f"\n{utils.get_table_row_count(silver_table)} rows in silver")
 ```
 
 **Common failures**
@@ -139,266 +215,34 @@ def all_change_dates(bronze: str) -> list:
 purchase date". Re-running a day is a no-op in effect because the source rows for that day
 are identical, so every update writes the same values.
 
-**Final question:** the answer is a view — `CREATE VIEW v_sales AS SELECT * FROM sales WHERE
-_is_active`. Nobody should have to remember a filter for correctness.
-
----
-
-## B02 — Data Quality and Governance
-
-### Steps 1–2
+### Step 6 — Validate
 
 ```python
-RULES = {
-    "price_positive":     "price > 0",
-    "quantity_positive":  "quantity > 0",
-    "product_id_present": "product_id IS NOT NULL",
-    "user_id_present":    "user_id IS NOT NULL",
-    "region_known":       "region IS NULL OR region IN ('NA','EU','APAC','LATAM')",
-}
+# 1. Active vs soft-deleted
+display(spark.sql(f"""
+    SELECT _is_active, COUNT(*) AS n
+    FROM {silver_table}
+    GROUP BY _is_active
+"""))
 
+# 2. No sale_id duplicated
+dupes = spark.sql(f"""
+    SELECT sale_id, COUNT(*) AS c
+    FROM {silver_table}
+    GROUP BY sale_id
+    HAVING COUNT(*) > 1
+""")
+assert dupes.count() == 0, "Found duplicated sale_id in silver"
 
-def evaluate_rules(df, rules):
-    for name, expr in rules.items():
-        df = df.withColumn(f"dq_{name}", F.expr(expr))
-    failed = F.array_compact(F.array(*[
-        F.when(~F.col(f"dq_{name}"), F.lit(name)) for name in rules
-    ]))
-    return df.withColumn("dq_failed_rules", failed)
-
-
-annotated = evaluate_rules(spark.table(sales_silver), RULES).cache()
-
-clean = annotated.filter(F.size("dq_failed_rules") == 0).drop(
-    *[f"dq_{n}" for n in RULES], "dq_failed_rules")
-bad = (annotated.filter(F.size("dq_failed_rules") > 0)
-       .withColumn("dq_quarantined_at", F.current_timestamp())
-       .drop(*[f"dq_{n}" for n in RULES]))
-
-clean.write.mode("overwrite").saveAsTable(validated_table)
-bad.write.mode("overwrite").saveAsTable(quarantine_table)
+# 3. One MERGE per day
+display(spark.sql(f"DESCRIBE HISTORY {silver_table}"))
+merge_days = spark.sql(f"""
+    SELECT COUNT(*) AS merges
+    FROM (DESCRIBE HISTORY {silver_table})
+    WHERE operation = 'MERGE'
+""")
+display(merge_days)
 ```
-
-`F.array_compact` needs DBR 14.3+. On older runtimes use
-`F.expr("filter(array(...), x -> x IS NOT NULL)")`.
-
-**Expected answers:** nobody finds out unless something watches the quarantine count —
-that is what Step 3 exists for. Fail the whole load rather than quarantine when the failure
-implies the *file* is wrong (wrong schema, truncated delivery), because partial ingestion of
-a corrupt file is worse than none.
-
-### Step 3 — Metrics
-
-```python
-def record_dq_metrics(df, rules, table_name, target):
-    total = df.count()
-    rows = [{
-        "run_timestamp": datetime.now(),
-        "table_name": table_name,
-        "rule_name": name,
-        "rows_checked": total,
-        "rows_failed": df.filter(~F.expr(expr)).count(),
-    } for name, expr in rules.items()]
-    (spark.createDataFrame(rows)
-     .withColumn("failure_rate", F.col("rows_failed") / F.col("rows_checked"))
-     .write.mode("append").saveAsTable(target))
-```
-
-### Step 4 — Constraints
-
-```sql
-ALTER TABLE {validated} ADD CONSTRAINT price_positive    CHECK (price > 0);
-ALTER TABLE {validated} ADD CONSTRAINT quantity_positive CHECK (quantity > 0);
-```
-
-**Expected answers:** the duplication is acceptable because the two mechanisms defend
-against different threats — the dict defends the pipeline's own output, the constraint
-defends against everything that is not the pipeline. Deployment order for a table with
-existing violations: clean or quarantine the violations first, then add the constraint; you
-cannot do it the other way round.
-
-### Step 5 — Masking
-
-```sql
-CREATE OR REPLACE VIEW {gold}.v_sales_masked AS
-SELECT s.sale_id, s.product_id, s.user_id, s.quantity, s.price, s.region,
-       CASE WHEN is_account_group_member('pii_readers') THEN u.email
-            ELSE regexp_replace(u.email, '^[^@]+', '***') END AS email,
-       CASE WHEN is_account_group_member('pii_readers') THEN u.phone
-            ELSE concat('***-', right(u.phone, 4)) END AS phone
-FROM {validated} s
-LEFT JOIN {silver}.users u ON s.user_id = u.user_id
-```
-
-**Expected answers:** a view protects one access path; a column mask on the table protects
-every path including ad-hoc queries and other views. Row filters restrict *which rows*, masks
-restrict *which values* — different axes. And the honest answer to "what stops them querying
-silver" is: nothing, unless you revoke `SELECT` on silver. A masking view without the
-corresponding revoke is theatre. This is the most valuable discussion in the notebook.
-
----
-
-## B03 — Performance Tuning
-
-### Step 1
-
-```python
-raw = spark.read.json(replay_dir)
-wide = (raw.crossJoin(spark.range(100).withColumnRenamed("id", "copy_n"))
-        .withColumn("event_id", F.concat_ws("-", "event_id", "copy_n"))
-        .drop("copy_n"))
-wide.repartition(200).write.mode("overwrite").saveAsTable(wide_table)
-```
-
-600,000 rows across 200 files, which is deliberately bad.
-
-### Step 2
-
-```python
-def measure(stage, note=""):
-    detail = utils.get_detail(wide_table)
-    t0 = time.perf_counter()
-    spark.sql(PROBE_SQL).collect()
-    duration_ms = int((time.perf_counter() - t0) * 1000)
-    files_scanned = spark.sql(FILES_SQL).collect()[0]["files"]
-    row = {"stage": stage, "metric_time": datetime.now(),
-           "num_files": detail["numFiles"], "size_bytes": detail["sizeInBytes"],
-           "files_scanned": files_scanned, "duration_ms": duration_ms, "note": note}
-    spark.createDataFrame([row]).write.mode("append").saveAsTable(tuning_log)
-    return row
-```
-
-**Expected answer on the second run being faster:** disk and result caching, plus JVM warmup.
-Benchmark by discarding the first run, or by using file counts, which do not warm up.
-
-### Step 3
-
-```sql
-ALTER TABLE {wide} CLUSTER BY (product_id);
-OPTIMIZE {wide};
-```
-
-Typical result: `num_files` 200 → under 10, `files_scanned` for `product_id = 7` from
-~200 down to 1–3.
-
-**Expected answers:** files scanned improves far more than wall-clock, because on a table
-this size the fixed query overhead dominates. Clustering on `device_type` (three distinct
-values) changes `files_scanned` barely at all — every file contains all three values. That
-prediction-then-check is the point of the exercise.
-
-### Step 4
-
-```python
-big = spark.table(wide_table)
-small = spark.table(f"{catalog}.{silver_schema}.products")
-big.join(small, "product_id").explain("formatted")
-
-spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
-big.join(small, "product_id").explain("formatted")   # now a SortMergeJoin
-spark.conf.set("spark.sql.autoBroadcastJoinThreshold", 10 * 1024 * 1024)
-```
-
-**Expected answers:** broadcasting avoids shuffling the large side, which is almost always
-the dominant cost; it stops being a good trade when the small side no longer fits comfortably
-in executor memory (default threshold 10 MB, practical ceiling a few hundred MB). AQE knows
-the *actual* post-filter size of each side at runtime, which the static optimizer only
-estimated from stale statistics.
-
-### Step 5 — the four bad suggestions
-
-1. Partitioning by a unique column creates one directory per row. Metadata explodes and
-   every query gets slower. Uniqueness is the worst possible partition key.
-2. `OPTIMIZE` rewrites files; running it after every write means writing the data twice
-   every time. Schedule it, or use predictive optimization.
-3. `shuffle.partitions` should track data volume and cluster size, not table size, and AQE
-   coalesces partitions at runtime anyway. 2000 tiny partitions is scheduling overhead.
-4. Caching pins memory that the query engine could use for execution, goes stale on the next
-   write, and Delta's own caching already covers most of the benefit. Cache only when you are
-   iterating over a fixed dataset in a single session.
-
----
-
-## B04 — Advanced ETL and Orchestration
-
-### Step 1 — SCD Type 2
-
-```python
-w = Window.partitionBy("product_id").orderBy("snapshot_date")
-
-changes = (spark.table(source)
-    .withColumn("prev_hash", F.lag(F.hash("name", "category", "price")).over(w))
-    .withColumn("cur_hash", F.hash("name", "category", "price"))
-    .filter(F.col("prev_hash").isNull() | (F.col("prev_hash") != F.col("cur_hash")))
-    .withColumnRenamed("snapshot_date", "valid_from"))
-
-w2 = Window.partitionBy("product_id").orderBy("valid_from")
-
-dim = (changes
-    .withColumn("next_from", F.lead("valid_from").over(w2))
-    .withColumn("valid_to", F.date_sub("next_from", 1))
-    .withColumn("is_current", F.col("next_from").isNull())
-    .withColumn("surrogate_key", F.sha2(F.concat_ws("|", "product_id", "valid_from"), 256))
-    .select("surrogate_key", "product_id", "name", "category", "price",
-            "valid_from", "valid_to", "is_current"))
-
-dim.write.mode("overwrite").saveAsTable(dim_product)
-```
-
-**Expected answer:** overlapping intervals make the sales-to-dimension join fan out, so one
-sale matches two dimension rows and revenue is double counted. It looks like a data problem
-in the fact table and it is not.
-
-### Step 2 — Idempotent backfill
-
-```python
-def load_day(target, source, sale_date):
-    df = (spark.table(source)
-          .filter((F.col("_is_active")) & (F.col("_created_at") == F.lit(sale_date)))
-          .groupBy(F.col("_created_at").alias("sale_date"), "product_id")
-          .agg(F.sum("quantity").alias("total_quantity"),
-               F.sum(F.col("quantity") * F.col("price")).alias("total_amount"),
-               F.count("*").alias("num_sales")))
-    (df.write.format("delta").mode("overwrite")
-       .option("replaceWhere", f"sale_date = '{sale_date}'")
-       .saveAsTable(target))
-    return df.count()
-```
-
-First call needs the table to exist or `replaceWhere` has nothing to match — create it empty
-with the right schema, or special-case the first write.
-
-**Expected answers:** if the written data falls outside the `replaceWhere` predicate the
-write fails with an invariant violation, which is the desired behaviour. Prefer
-`replaceWhere` when the load is naturally partitioned by a column and you are rewriting whole
-slices; prefer `MERGE` when changes are scattered across the key space.
-
-### Step 4 — The job YAML
-
-```yaml
-        - task_key: data_quality
-          depends_on:
-            - task_key: ingest_and_merge
-          notebook_task:
-            notebook_path: ${var.notebook_root}/B02-data-quality-and-governance
-            base_parameters:
-              catalog: ${var.target_catalog}
-            source: WORKSPACE
-
-        - task_key: build_gold
-          depends_on:
-            - task_key: data_quality
-          notebook_task:
-            notebook_path: ${var.notebook_root}/B04-advanced-etl-and-orchestration
-            base_parameters:
-              catalog: ${var.target_catalog}
-            source: WORKSPACE
-```
-
-**Expected answers:** the username in the job name prevents thirty students from deploying
-over each other's job in a shared workspace. Re-running just the failed task is only safe if
-that task is idempotent — which is exactly what Steps 2 and 3 built, so the answer connects
-back. Deploying `mode: production` by accident un-pauses schedules and drops the `[dev user]`
-prefix, so every student's job collides on one name and starts running on a timer.
 
 ---
 
