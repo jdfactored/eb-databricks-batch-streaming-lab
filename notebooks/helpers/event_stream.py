@@ -81,7 +81,11 @@ BASE_TIME = datetime(2026, 3, 2, 8, 0, 0, tzinfo=timezone.utc)
 REPLAY_DIR = "web_events_replay"
 DRIP_DIR = "web_events_live"
 META_DIR = "_meta"
+STAGED_DIR = "web_events_staged"
 
+
+def staged_path() -> str:
+    return f"{utils.get_configs()['volume_raw']}/{STAGED_DIR}"
 
 # --------------------------------------------------------------------------- generation
 
@@ -152,6 +156,32 @@ def _upload_json(path: str, payload: List[Dict]) -> None:
 def replay_path() -> str:
     return f"{utils.get_configs()['volume_raw']}/{REPLAY_DIR}"
 
+def reset_replay_directory():
+    """Clears replay_path and copies only files 001-008."""
+    target = replay_path()
+    staged = staged_path()
+    
+    # Clean target directory
+    if utils.path_exists(target):
+        for f in utils.list_files(target):
+            utils.workspace.files.delete(f.path)
+
+    # Copy files 001 to 008 (pre-schema drift)
+    for i in range(1, SCHEMA_DRIFT_FILE):
+        filename = f"events_{i:03d}.json"
+        body = utils.workspace.files.download(f"{staged}/{filename}").contents.read()
+        utils.workspace.files.upload(f"{target}/{filename}", io.BytesIO(body), overwrite=True)
+    print(f"Replay path prepared with initial files 001-{SCHEMA_DRIFT_FILE-1:03d}.")
+
+def land_drift_files():
+    """Simulates new data landing mid-stream by copying files 009-012 into replay_path."""
+    target = replay_path()
+    staged = staged_path()
+    for i in range(SCHEMA_DRIFT_FILE, REPLAY_FILES + 1):
+        filename = f"events_{i:03d}.json"
+        body = utils.workspace.files.download(f"{staged}/{filename}").contents.read()
+        utils.workspace.files.upload(f"{target}/{filename}", io.BytesIO(body), overwrite=True)
+    print(f"Landed drift files {SCHEMA_DRIFT_FILE:03d}-{REPLAY_FILES:03d} into {target}.")
 
 def drip_path() -> str:
     return f"{utils.get_configs()['volume_raw']}/{DRIP_DIR}"
@@ -189,19 +219,19 @@ def build_manifest() -> Dict:
 
 
 def write_replay_files(force: bool = False) -> Dict:
-    """
-    Generate the fixed replay set into the student's volume. Idempotent: skips if the
-    files are already there unless force=True.
-    """
-    target = replay_path()
+    """Generates all 12 files into staging and initializes replay_path with files 001-008."""
+    staged = staged_path()
 
-    if not force and utils.path_exists(target) and len(utils.list_files(target)) == REPLAY_FILES:
-        print(f"Replay files already present at {target} — skipping.")
+    if not force and utils.path_exists(staged) and len(utils.list_files(staged)) == REPLAY_FILES:
+        print(f"Replay files already present at {staged} — skipping.")
     else:
         for i in range(1, REPLAY_FILES + 1):
             events = generate_file_events(i)
-            _upload_json(f"{target}/events_{i:03d}.json", events)
+            _upload_json(f"{staged}/events_{i:03d}.json", events)
             print(f"  wrote events_{i:03d}.json  ({len(events)} events)")
+
+    # 2. Populate replay directory with files 001-008 only
+    reset_replay_directory()
 
     manifest = build_manifest()
     utils.workspace.files.upload(
@@ -212,6 +242,7 @@ def write_replay_files(force: bool = False) -> Dict:
     print(f"{manifest['distinct_event_ids']} distinct event_ids "
           f"({manifest['duplicate_events']} duplicates)")
     print(f"referrer_url appears from file {manifest['schema_drift_file']:03d} onwards")
+
     return manifest
 
 
