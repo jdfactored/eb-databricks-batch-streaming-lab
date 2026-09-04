@@ -262,7 +262,7 @@ df.count()   # AnalysisException: Queries with streaming sources must be execute
 **Expected answer:** a stream has no end, so "how many rows" has no answer at any instant.
 Aggregations over a stream must be incremental and must emit under an output mode.
 
-### Steps 2–3
+### Step 2
 
 ```python
 query = (df.writeStream.format("delta")
@@ -271,7 +271,21 @@ query = (df.writeStream.format("delta")
          .trigger(availableNow=True)
          .toTable(rate_table))
 query.awaitTermination()
+
+print(spark.table(rate_table).count())
+
+display(spark.sql(f"DESCRIBE HISTORY {rate_table}"))
 ```
+
+**Expected answer on `DESCRIBE HISTORY`:** the `operation` column reads
+`STREAMING UPDATE`, not `WRITE`. A batch `saveAsTable`/`insertInto` commits as a single
+`WRITE`; a streaming sink commits once per micro-batch as `STREAMING UPDATE` and the
+`operationMetrics` for that row includes `numOutputRows` for just that batch, not the
+whole table. Even though `availableNow` looks like "run once", it can still span several
+micro-batches internally — check `len(query.recentProgress)` if the history shows more
+than one `STREAMING UPDATE` row and the count should still explain itself.
+
+### Step 3
 
 ```python
 query = (df.writeStream.format("delta")
@@ -279,8 +293,11 @@ query = (df.writeStream.format("delta")
          .outputMode("append")
          .trigger(processingTime="5 seconds")
          .toTable(rate_table))
+
 streaming_utils.await_batches(query, batches=4)
+
 streaming_utils.show_progress(query)
+
 query.stop()
 ```
 

@@ -62,87 +62,21 @@ stops everything, but consider a workspace-level idle policy as a backstop.
 | Notebook | Target | Where students lose time |
 | :-- | :-- | :-- |
 | `00-setup` | 5 min | Nothing, unless grants are wrong |
-| `B01` | 75 min | Step 5, MERGE clause ordering |
-| `B02` | 60 min | Step 1, building `dq_failed_rules` as an array |
-| `B03` | 60 min | Step 4, reading the plan output |
-| `B04` | 75 min | Step 1, SCD2 interval arithmetic |
-| `S01` | 50 min | Step 5, understanding what restart actually did |
-| `S02` | 70 min | Step 3, the deliberate failure |
-| `S03` | 75 min | Step 3, `foreachBatch` with a null-safe merge key |
-| `S04` | 65 min | Step 2, forgetting to use fresh checkpoints per run |
+| `01` | 65 min | Step 5, MERGE clause ordering |
 
-About 9 hours. Comfortable over two weeks part-time.
+About 2 hours. Comfortable over two weeks part-time.
 
 ---
 
 ## Known sticking points
 
-**B01 Step 5 — MERGE clause order.** `WHEN MATCHED AND status = 'delete'` must come before the
+**01 Step 5 — MERGE clause order.** `WHEN MATCHED AND status = 'delete'` must come before the
 general `WHEN MATCHED`. First match wins, so the general clause swallows the deletes and
 `_is_active` never goes false. The check message points at it but does not explain why. This
 is the single best whole-room teaching moment in the batch track.
 
-**B01 Step 5 — multiple source rows.** Students who skip the `ROW_NUMBER` dedup get
+**01 Step 5 — multiple source rows.** Students who skip the `ROW_NUMBER` dedup get
 `Cannot perform Merge as multiple source rows matched`. Let them hit it.
-
-**B02 Step 1 — `array_compact`.** Needs DBR 14.3+. On older runtimes:
-`F.expr("filter(array(...), x -> x IS NOT NULL)")`. Mention it if your workspace runs older.
-
-**B03 Step 2 — timing noise.** The second run of any query is faster. Students conclude their
-change worked when they have measured cache warmup. The notebook asks about it directly;
-reinforce that `files_scanned` is the trustworthy number and `duration_ms` is context.
-
-**S02 Step 2 — the deliberate failure.** The stream stops with `UnknownFieldException` at file
-009. The notebook says it will happen, in bold, before the cell. Students will still ask.
-Consider mentioning it in the live session so the first person to hit it does not lose ten
-minutes.
-
-**S03 Step 2 — inner vs left join.** More than half the events are `view` with a null
-`product_id`. An inner join deletes them and the check catches it, but the message is worth
-walking through because the same mistake in production is silent.
-
-**S03 Step 3 — the null-safe merge key.** `ON t.product_id = s.product_id` never matches null
-product ids, so every batch inserts a fresh null row and the funnel accumulates duplicates.
-`<=>` fixes it. This one is genuinely hard to spot; be ready to hint.
-
-**S04 Step 2 — shared checkpoints.** Both tuning runs must have their own checkpoint, schema
-location and target table. Reusing one means run B finds nothing to consume and reports 0
-rows. The check that both runs saw the same row count catches it.
-
-**Stale checkpoints generally.** The most common "my stream does nothing" cause across the
-whole streaming track. `utils.reset_path(checkpoint)` plus dropping the table is the fix, and
-it is worth saying out loud in the first session.
-
----
-
-## Grading rubric
-
-Out of 100. Batch and streaming weighted equally.
-
-| Component | Points | Looking for |
-| :-- | --: | :-- |
-| Checks pass, batch track | 20 | 5 per notebook |
-| Checks pass, streaming track | 20 | 5 per notebook |
-| Code quality | 10 | Uses `utils.get_configs()`; no hardcoded names; loops instead of copy-paste; streams always stopped |
-| B01–B02 reflections | 10 | The idempotency source; where masking actually fails (nothing stops them querying silver) |
-| B03–B04 reflections | 10 | Measurement discipline; the SCD2 overlap consequence |
-| S01–S02 reflections | 10 | What the checkpoint stores; why `addNewColumns` stopping is correct |
-| S03–S04 reflections | 10 | The watermark trade-off; `foreachBatch` at-least-once |
-| B04 Step 4 job | 5 | Working job graph with correct dependencies |
-| Wrap-up questions | 5 | Q3 and Q5 are the discriminating ones |
-
-**Auto-fail:** notebooks submitted without outputs; a streaming query left active at
-submission time.
-
-**Be generous with:** anyone who solves S03 Step 3 with a proper `batch_id` idempotency guard
-rather than the plain accumulation — that is beyond what was asked and shows they understood
-the failure mode. Also anyone who writes the B02 masking answer honestly, i.e. "the view is
-pointless unless you revoke `SELECT` on silver". That is the correct and slightly
-uncomfortable answer.
-
-**Dock code quality, not correctness, for:** partitioning where clustering was taught,
-hardcoded table names, and `awaitTermination()` on a `processingTime` query (works, but it is
-how students accidentally leave streams running).
 
 ---
 
