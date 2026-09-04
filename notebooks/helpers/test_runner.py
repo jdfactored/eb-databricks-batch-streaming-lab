@@ -18,7 +18,7 @@ import re
 import traceback
 from typing import Optional
 
-from helpers.tests import *  # noqa: F401,F403  (registers all test modules)
+from helpers.tests import *
 
 
 class Colors:
